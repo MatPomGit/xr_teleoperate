@@ -134,6 +134,11 @@
 ```
 
 ```bash
+# 安装 teleimager 模块
+(tv) unitree@Host:~/xr_teleoperate/teleop/teleimager$ pip install -e . --no-deps
+```
+
+```bash
 # 安装 televuer 模块
 (tv) unitree@Host:~/xr_teleoperate$ cd teleop/televuer
 (tv) unitree@Host:~/xr_teleoperate/teleop/televuer$ pip install -e .
@@ -245,7 +250,7 @@ build  cert.pem  key.pem  LICENSE  pyproject.toml  README.md  rootCA.key  rootCA
 
 |    ⚙️ 参数     |                      📜 说明                      |                       🔘 目前可选值                       | 📌 默认值 |
 | :-----------: | :----------------------------------------------: | :------------------------------------------------------: | :------: |
-| `--frequency` |               设置录制和控制的 FPS               |                        任意浮点数                        |   30.0   |
+| `--frequency` |               设置录制和控制的 FPS               |                  任意正常范围内的浮点数                  |   30.0   |
 |  `--xr-mode`  |    选择 XR 输入模式（通过什么方式控制机器人）    | `hand`（**手势跟踪**）<br />`controller`（**手柄跟踪**） |  `hand`  |
 |    `--arm`    |      选择机器人设备类型（可参考 0. 📖 介绍）      |        `G1_29`<br />`G1_23`<br />`H1_2`<br />`H1`        | `G1_29`  |
 |    `--ee`     | 选择手臂的末端执行器设备类型（可参考 0. 📖 介绍） |    `dex1`<br />`dex3`<br />`inspire1`<br />`brainco`     | 无默认值 |
@@ -376,14 +381,14 @@ build  cert.pem  key.pem  LICENSE  pyproject.toml  README.md  rootCA.key  rootCA
 
 ```bash
 # 将本地主机 xr_teleoperate/teleop/televuer 路径下在 1.1 节配置的 key.pem 和 cert.pem 文件拷贝到 PC2 对应路径
+# 这两个文件是 teleimager 启动 WebRTC 服务时所必须的
 (tv) unitree@Host:~$ scp ~/xr_teleoperate/teleop/televuer/key.pem ~/xr_teleoperate/teleop/televuer/cert.pem unitree@192.168.123.164:~/teleimager
 ```
 
-3. 在**开发计算单元 PC2** 中按照 teleimager 文档配置 cam_config.yaml 并启动图像服务程序
+3. 在**开发计算单元 PC2** 中按照 teleimager 文档配置 cam_config_server.yaml 并启动图像服务程序
 
 ```bash
-# 假设使用 conda 创建环境
-(teleimager) unitree@PC2:~/image_server$ sudo $(which python) image_server.py
+(teleimager) unitree@PC2:~/image_server$ sudo $(which python) -m teleimager.image_server
 ```
 
 4. 在**本地主机**上执行以下命令订阅图像：
