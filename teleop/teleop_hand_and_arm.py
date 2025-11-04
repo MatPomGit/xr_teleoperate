@@ -123,6 +123,15 @@ if __name__ == '__main__':
                                      img_shape=camera_config['head_camera']['image_shape'],
                                      webrtc=camera_config['head_camera']['enable_webrtc'],
                                      webrtc_url=f"https://{args.img_server_ip}:{camera_config['head_camera']['webrtc_port']}/offer")
+        
+        # motion mode (G1: Regular mode R1+X, not Running mode R2+A)
+        if args.motion:
+            if args.xr_mode == "controller":
+                loco_wrapper = LocoClientWrapper()
+        else:
+            motion_switcher = MotionSwitcher()
+            status, result = motion_switcher.Enter_Debug_Mode()
+            logger_mp.info(f"Enter debug mode: {'Success' if status == 0 else 'Failed'}")
 
         # arm
         if args.arm == "G1_29":
@@ -206,15 +215,6 @@ if __name__ == '__main__':
             from teleop.utils.sim_state_topic import start_sim_state_subscribe
             sim_state_subscriber = start_sim_state_subscribe()
 
-        # motion mode (G1: Regular mode R1+X, not Running mode R2+A)
-        if args.motion:
-            if args.xr_mode == "controller":
-                loco_wrapper = LocoClientWrapper()
-        else:
-            motion_switcher = MotionSwitcher()
-            status, result = motion_switcher.Enter_Debug_Mode()
-            logger_mp.info(f"Enter debug mode: {status}, {result}")
-        
         # record + headless / non-headless mode
         if args.record:
             recorder = EpisodeWriter(task_dir = os.path.join(args.task_dir, args.task_name),
@@ -460,23 +460,47 @@ if __name__ == '__main__':
     except KeyboardInterrupt:
         logger_mp.info("KeyboardInterrupt, exiting program...")
     finally:
-        arm_ctrl.ctrl_dual_arm_go_home()
-        img_client.close()
-        tv_wrapper.close()
-        if not args.motion:
-            status, result = motion_switcher.Exit_Debug_Mode()
-            logger_mp.info(f"Exit debug mode: {status}, {result}")
+        try:
+            arm_ctrl.ctrl_dual_arm_go_home()
+        except Exception as e:
+            logger_mp.error(f"Failed to ctrl_dual_arm_go_home: {e}")
+        
+        try:
+            if args.ipc:
+                ipc_server.stop()
+            else:
+                stop_listening()
+                listen_keyboard_thread.join()
+        except Exception as e:
+            logger_mp.error(f"Failed to stop keyboard listener or ipc server: {e}")
+        
+        try:
+            img_client.close()
+        except Exception as e:
+            logger_mp.error(f"Failed to close image client: {e}")
 
-        if args.ipc:
-            ipc_server.stop()
-        else:
-            stop_listening()
-            listen_keyboard_thread.join()
+        try:
+            tv_wrapper.close()
+        except Exception as e:
+            logger_mp.error(f"Failed to close televuer wrapper: {e}")
 
-        if args.sim:
-            sim_state_subscriber.stop_subscribe()
+        try:
+            if not args.motion:
+                status, result = motion_switcher.Exit_Debug_Mode()
+                logger_mp.info(f"Exit debug mode: {'Success' if status == 3104 else 'Failed'}")
+        except Exception as e:
+            logger_mp.error(f"Failed to exit debug mode: {e}")
 
-        if args.record:
-            recorder.close()
+        try:
+            if args.sim:
+                sim_state_subscriber.stop_subscribe()
+        except Exception as e:
+            logger_mp.error(f"Failed to stop sim state subscriber: {e}")
+        
+        try:
+            if args.record:
+                recorder.close()
+        except Exception as e:
+            logger_mp.error(f"Failed to close recorder: {e}")
         logger_mp.info("Finally, exiting program.")
         exit(0)

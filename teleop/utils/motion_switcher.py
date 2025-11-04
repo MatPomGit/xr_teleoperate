@@ -8,6 +8,7 @@ import time
 # MotionSwitcher used to switch mode between debug mode and ai mode
 class MotionSwitcher:
     def __init__(self):
+        ChannelFactoryInitialize(0)
         self.msc = MotionSwitcherClient()
         self.msc.SetTimeout(1.0)
         self.msc.Init()
