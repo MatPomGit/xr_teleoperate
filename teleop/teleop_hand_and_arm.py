@@ -231,7 +231,14 @@ if __name__ == '__main__':
                                      frequency = args.frequency, 
                                      rerun_log = not args.headless)
 
-        logger_mp.info("Please enter the start signal (enter 'r' to start the subsequent program)")
+        logger_mp.info("----------------------------------------------------------------")
+        logger_mp.info("🟢  Press [r] to start syncing the robot with your movements.")
+        if args.record:
+            logger_mp.info("🟡  Press [s] to START or SAVE recording (toggle cycle).")
+        else:
+            logger_mp.info("🔵  Recording is DISABLED (run with --record to enable).")
+        logger_mp.info("🔴  Press [q] to stop and exit the program.")
+        logger_mp.info("⚠️  IMPORTANT: Please keep your distance and stay safe.")
         READY = True                  # now ready to (1) enter START state
         while not START and not STOP: # wait for start or stop signal.
             time.sleep(0.033)
@@ -239,7 +246,7 @@ if __name__ == '__main__':
                 head_img, _ = img_client.get_head_frame()
                 tv_wrapper.render_to_xr(head_img)
 
-        logger_mp.info("---------------------🚀start program🚀-------------------------")
+        logger_mp.info("---------------------🚀start Tracking🚀-------------------------")
         arm_ctrl.speed_gradual_max()
         # main loop. robot start to follow VR user's motion
         while not STOP:
@@ -464,7 +471,7 @@ if __name__ == '__main__':
             logger_mp.debug(f"main process sleep: {sleep_time}")
 
     except KeyboardInterrupt:
-        logger_mp.info("KeyboardInterrupt, exiting program...")
+        logger_mp.info("⛔ KeyboardInterrupt, exiting program...")
     except Exception:
         import traceback
         logger_mp.error(traceback.format_exc())
@@ -512,5 +519,5 @@ if __name__ == '__main__':
                 recorder.close()
         except Exception as e:
             logger_mp.error(f"Failed to close recorder: {e}")
-        logger_mp.info("Finally, exiting program.")
+        logger_mp.info("✅ Finally, exiting program.")
         exit(0)
