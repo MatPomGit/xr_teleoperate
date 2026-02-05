@@ -1,67 +1,159 @@
-import time
-import argparse
-from multiprocessing import Value, Array, Lock
-import threading
-import logging_mp
-logging_mp.basic_config(level=logging_mp.INFO)
-logger_mp = logging_mp.get_logger(__name__)
+"""
+teleop_hand_and_arm.py - Główny skrypt uruchomieniowy dla systemu teleoperation
+=================================================================================
 
+Ten plik zawiera główną logikę programu do zdalnego sterowania robotem humanoidalnym 
+za pomocą urządzeń XR (gogle VR/AR).
+
+CO ROBI TEN PROGRAM:
+1. Inicjalizuje połączenie z robotem (przez DDS)
+2. Łączy się z urządzeniem XR (przez televuer)
+3. Odbiera dane ruchu z XR (pozycje dłoni, kontrolerów)
+4. Przetwarza je na komendy dla robota (kinematyka odwrotna)
+5. Wysyła komendy do robota w czasie rzeczywistym
+6. Opcjonalnie nagrywa dane do późniejszego użycia (uczenie maszynowe)
+
+DLA POCZĄTKUJĄCYCH:
+- DDS = Data Distribution Service - protokół komunikacji między programami
+- XR = Extended Reality - gogle VR/AR
+- IK = Inverse Kinematics - obliczanie kątów stawów z pozycji docelowej
+- Teleoperation = zdalne sterowanie robotem w czasie rzeczywistym
+"""
+
+# === IMPORT BIBLIOTEK PODSTAWOWYCH ===
+import time           # Do pomiaru czasu i opóźnień
+import argparse       # Do parsowania argumentów wiersza poleceń (--sim, --record, etc.)
+from multiprocessing import Value, Array, Lock  # Do współdzielenia danych między procesami
+import threading      # Do uruchamiania zadań równoległych
+import logging_mp     # Biblioteka do logowania w środowisku wieloprocesowym
+logging_mp.basic_config(level=logging_mp.INFO)  # Konfiguracja poziomu logowania (INFO = podstawowe informacje)
+logger_mp = logging_mp.get_logger(__name__)     # Tworzy logger dla tego modułu
+
+# === KONFIGURACJA ŚCIEŻEK ===
+# Python potrzebuje wiedzieć gdzie szukać innych modułów projektu
 import os 
 import sys
-current_dir = os.path.dirname(os.path.abspath(__file__))
-parent_dir = os.path.dirname(current_dir)
-sys.path.append(parent_dir)
+current_dir = os.path.dirname(os.path.abspath(__file__))  # Katalog tego pliku
+parent_dir = os.path.dirname(current_dir)                  # Katalog nadrzędny
+sys.path.append(parent_dir)  # Dodaj katalog nadrzędny do ścieżki wyszukiwania modułów
 
-from unitree_sdk2py.core.channel import ChannelFactoryInitialize # dds 
-from televuer import TeleVuerWrapper
+# === IMPORT BIBLIOTEK PROJEKTU ===
+# Komunikacja z robotem
+from unitree_sdk2py.core.channel import ChannelFactoryInitialize  # Inicjalizacja DDS (komunikacja z robotem)
+
+# Interfejs XR (gogle VR/AR)
+from televuer import TeleVuerWrapper  # Obsługa połączenia z goglami XR i śledzenia ruchów
+
+# Sterowanie ramieniem robota
 from teleop.robot_control.robot_arm import G1_29_ArmController, G1_23_ArmController, H1_2_ArmController, H1_ArmController
-from teleop.robot_control.robot_arm_ik import G1_29_ArmIK, G1_23_ArmIK, H1_2_ArmIK, H1_ArmIK
-from teleimager.image_client import ImageClient
-from teleop.utils.episode_writer import EpisodeWriter
-from teleop.utils.ipc import IPC_Server
-from teleop.utils.motion_switcher import MotionSwitcher, LocoClientWrapper
-from sshkeyboard import listen_keyboard, stop_listening
+# Te kontrolery wysyłają komendy do motorów ramion różnych modeli robotów
 
-# for simulation
+# Kinematyka odwrotna (IK) ramienia
+from teleop.robot_control.robot_arm_ik import G1_29_ArmIK, G1_23_ArmIK, H1_2_ArmIK, H1_ArmIK
+# IK = Inverse Kinematics - oblicza jakie kąty stawów potrzebne są aby ramię osiągnęło żądaną pozycję
+
+# Obsługa obrazu z kamer
+from teleimager.image_client import ImageClient  # Klient do odbierania strumieni wideo z kamer robota
+
+# Narzędzia pomocnicze
+from teleop.utils.episode_writer import EpisodeWriter     # Zapisuje dane nagrań do plików
+from teleop.utils.ipc import IPC_Server                   # Komunikacja międzyprocesowa (sterowanie z innych programów)
+from teleop.utils.motion_switcher import MotionSwitcher, LocoClientWrapper  # Przełączanie trybów ruchu robota
+from sshkeyboard import listen_keyboard, stop_listening   # Nasłuchiwanie klawiszy klawiatury (r, q, s)
+
+# === FUNKCJE DO SYMULACJI ===
 from unitree_sdk2py.core.channel import ChannelPublisher
 from unitree_sdk2py.idl.std_msgs.msg.dds_ import String_
-def publish_reset_category(category: int, publisher): # Scene Reset signal
-    msg = String_(data=str(category))
-    publisher.Write(msg)
+
+def publish_reset_category(category: int, publisher):
+    """
+    Publikuje sygnał resetowania sceny w symulacji.
+    
+    Args:
+        category (int): Kategoria resetu (różne typy resetowania sceny)
+        publisher: Wydawca DDS do wysyłania wiadomości
+        
+    Dla początkujących:
+    Ta funkcja jest używana tylko w symulacji aby zresetować środowisko
+    (np. przywrócić obiekty do pozycji początkowych)
+    """
+    msg = String_(data=str(category))  # Tworzy wiadomość ze stringiem
+    publisher.Write(msg)               # Publikuje wiadomość przez DDS
     logger_mp.info(f"published reset category: {category}")
 
-# state transition
-START          = False  # Enable to start robot following VR user motion
-STOP           = False  # Enable to begin system exit procedure
-READY          = False  # Ready to (1) enter START state, (2) enter RECORD_RUNNING state
-RECORD_RUNNING = False  # True if [Recording]
-RECORD_TOGGLE  = False  # Toggle recording state
+# === ZMIENNE GLOBALNE DLA MASZYNY STANÓW ===
+# Te zmienne kontrolują stan programu (czy robot jest aktywny, czy nagrywamy, etc.)
+
+START          = False  # Włącz aby robot zaczął śledzić ruchy użytkownika VR
+STOP           = False  # Włącz aby rozpocząć procedurę zamykania systemu
+READY          = False  # Gotowy do (1) wejścia w stan START, (2) wejścia w stan RECORD_RUNNING
+RECORD_RUNNING = False  # True jeśli [Nagrywanie] jest aktywne
+RECORD_TOGGLE  = False  # Przełącz stan nagrywania
+
+# === DIAGRAM PRZEJŚĆ STANÓW ===
+# Pokazuje jak program przechodzi między różnymi stanami:
+#
 #  -------        ---------                -----------                -----------            ---------
-#   state          [Ready]      ==>        [Recording]     ==>         [AutoSave]     -->     [Ready]
+#   Stan           [Gotowy]      ==>        [Nagrywanie]    ==>         [AutoZapis]    -->     [Gotowy]
 #  -------        ---------      |         -----------      |         -----------      |     ---------
-#   START           True         |manual      True          |manual      True          |        True
-#   READY           True         |set         False         |set         False         |auto    True
-#   RECORD_RUNNING  False        |to          True          |to          False         |        False
+#   START           True         |ręcznie     True          |ręcznie     True          |        True
+#   READY           True         |ustaw       False         |ustaw       False         |auto    True
+#   RECORD_RUNNING  False        |na          True          |na          False         |        False
 #                                ∨                          ∨                          ∨
 #   RECORD_TOGGLE   False       True          False        True          False                  False
 #  -------        ---------                -----------                 -----------            ---------
-#  ==> manual: when READY is True, set RECORD_TOGGLE=True to transition.
-#  --> auto  : Auto-transition after saving data.
+#  
+#  ==> ręcznie (manual): gdy READY jest True, ustaw RECORD_TOGGLE=True aby przejść do następnego stanu.
+#  --> auto: Automatyczne przejście po zapisaniu danych.
+#
+# DLA POCZĄTKUJĄCYCH - Jak używać:
+# 1. Uruchom program - stan to [Gotowy]
+# 2. Naciśnij 'r' - robot zaczyna śledzić Twoje ruchy
+# 3. Naciśnij 's' - rozpoczyna nagrywanie (stan [Nagrywanie])
+# 4. Naciśnij 's' ponownie - zatrzymuje i zapisuje (stan [AutoZapis], potem wraca do [Gotowy])
+# 5. Naciśnij 'q' - zamyka program
 
 def on_press(key):
+    """
+    Funkcja wywoływana gdy użytkownik naciśnie klawisz na klawiaturze.
+    
+    Args:
+        key (str): Naciśnięty klawisz ('r', 'q', 's', etc.)
+        
+    Obsługiwane klawisze:
+    - 'r' (run)    : Rozpocznij teleoperation - robot zaczyna śledzić Twoje ruchy
+    - 'q' (quit)   : Zakończ program i bezpiecznie zamknij połączenia
+    - 's' (save)   : Przełącz nagrywanie (start/stop)
+    
+    Dla początkujących:
+    global - słowo kluczowe pozwalające modyfikować zmienne globalne
+    """
     global STOP, START, RECORD_TOGGLE
     if key == 'r':
-        START = True
+        START = True  # Rozpocznij teleoperation
     elif key == 'q':
-        START = False
-        STOP = True
+        START = False  # Zatrzymaj teleoperation
+        STOP = True    # Rozpocznij procedurę zamykania
     elif key == 's' and START == True:
-        RECORD_TOGGLE = True
+        RECORD_TOGGLE = True  # Przełącz stan nagrywania
     else:
-        logger_mp.warning(f"[on_press] {key} was pressed, but no action is defined for this key.")
+        logger_mp.warning(f"[on_press] Naciśnięto {key}, ale nie zdefiniowano akcji dla tego klawisza.")
 
 def get_state() -> dict:
-    """Return current heartbeat state"""
+    """
+    Zwraca aktualny stan systemu jako słownik.
+    
+    Returns:
+        dict: Słownik ze stanami:
+              - START: Czy teleoperation jest aktywna
+              - STOP: Czy rozpoczęto procedurę zamykania
+              - READY: Czy system jest gotowy do nagrywania
+              - RECORD_RUNNING: Czy nagrywanie jest aktywne
+              
+    Dla początkujących:
+    Ta funkcja jest używana przez inne moduły (np. IPC) do sprawdzenia
+    w jakim stanie znajduje się obecnie program.
+    """
     global START, STOP, RECORD_RUNNING, READY
     return {
         "START": START,
@@ -70,32 +162,100 @@ def get_state() -> dict:
         "RECORD_RUNNING": RECORD_RUNNING,
     }
 
+# === GŁÓWNA FUNKCJA PROGRAMU ===
 if __name__ == '__main__':
+    # === KONFIGURACJA ARGUMENTÓW WIERSZA POLECEŃ ===
+    # ArgumentParser pozwala użytkownikom przekazywać opcje przy uruchamianiu programu
+    # Przykład: python teleop_hand_and_arm.py --sim --ee=dex3 --record
     parser = argparse.ArgumentParser()
-    # basic control parameters
-    parser.add_argument('--frequency', type = float, default = 30.0, help = 'control and record \'s frequency')
-    parser.add_argument('--input-mode', type=str, choices=['hand', 'controller'], default='hand', help='Select XR device input tracking source')
-    parser.add_argument('--display-mode', type=str, choices=['immersive', 'ego', 'pass-through'], default='immersive', help='Select XR device display mode')
-    parser.add_argument('--arm', type=str, choices=['G1_29', 'G1_23', 'H1_2', 'H1'], default='G1_29', help='Select arm controller')
-    parser.add_argument('--ee', type=str, choices=['dex1', 'dex3', 'inspire_ftp', 'inspire_dfx', 'brainco'], help='Select end effector controller')
-    parser.add_argument('--img-server-ip', type=str, default='192.168.123.164', help='IP address of image server, used by teleimager and televuer')
-    parser.add_argument('--network-interface', type=str, default=None, help='Network interface for dds communication, e.g., eth0, wlan0. If None, use default interface.')
-    # mode flags
-    parser.add_argument('--motion', action = 'store_true', help = 'Enable motion control mode')
-    parser.add_argument('--headless', action='store_true', help='Enable headless mode (no display)')
-    parser.add_argument('--sim', action = 'store_true', help = 'Enable isaac simulation mode')
-    parser.add_argument('--ipc', action = 'store_true', help = 'Enable IPC server to handle input; otherwise enable sshkeyboard')
-    parser.add_argument('--affinity', action = 'store_true', help = 'Enable high priority and set CPU affinity mode')
-    # record mode and task info
-    parser.add_argument('--record', action = 'store_true', help = 'Enable data recording mode')
-    parser.add_argument('--task-dir', type = str, default = './utils/data/', help = 'path to save data')
-    parser.add_argument('--task-name', type = str, default = 'pick cube', help = 'task file name for recording')
-    parser.add_argument('--task-goal', type = str, default = 'pick up cube.', help = 'task goal for recording at json file')
-    parser.add_argument('--task-desc', type = str, default = 'task description', help = 'task description for recording at json file')
-    parser.add_argument('--task-steps', type = str, default = 'step1: do this; step2: do that;', help = 'task steps for recording at json file')
+    
+    # --- Podstawowe parametry sterowania ---
+    parser.add_argument('--frequency', type = float, default = 30.0, 
+                        help = 'Częstotliwość sterowania i nagrywania w Hz (klatek na sekundę). '
+                               'Określa jak często robot aktualizuje swoją pozycję. Domyślnie 30 Hz.')
+    
+    parser.add_argument('--input-mode', type=str, choices=['hand', 'controller'], default='hand', 
+                        help='Wybierz źródło śledzenia wejścia urządzenia XR:\n'
+                             '  hand - śledź pozycje dłoni użytkownika (wymaga wsparcia hand tracking)\n'
+                             '  controller - śledź kontrolery VR')
+    
+    parser.add_argument('--display-mode', type=str, choices=['immersive', 'ego', 'pass-through'], default='immersive', 
+                        help='Wybierz tryb wyświetlania XR:\n'
+                             '  immersive - pełna immersja, widzisz tylko obraz z robota\n'
+                             '  ego - widok pass-through + małe okno pierwszej osoby\n'
+                             '  pass-through - tylko widok pass-through (zobacz otoczenie)')
+    
+    parser.add_argument('--arm', type=str, choices=['G1_29', 'G1_23', 'H1_2', 'H1'], default='G1_29', 
+                        help='Wybierz kontroler ramienia:\n'
+                             '  G1_29 - Robot G1 z 29 stopniami swobody\n'
+                             '  G1_23 - Robot G1 z 23 stopniami swobody\n'
+                             '  H1_2  - Robot H1 z ramieniem 7-DoF\n'
+                             '  H1    - Robot H1 z ramieniem 4-DoF')
+    
+    parser.add_argument('--ee', type=str, choices=['dex1', 'dex3', 'inspire_ftp', 'inspire_dfx', 'brainco'], 
+                        help='Wybierz kontroler efektora końcowego (dłoń/chwytak):\n'
+                             '  dex1        - Chwytaki Unitree Dex1-1\n'
+                             '  dex3        - Dłonie zręcznościowe Unitree Dex3-1\n'
+                             '  inspire_ftp - Dłonie zręcznościowe Inspire FTP\n'
+                             '  inspire_dfx - Dłonie zręcznościowe Inspire DFX\n'
+                             '  brainco     - Dłonie zręcznościowe BrainCo')
+    
+    parser.add_argument('--img-server-ip', type=str, default='192.168.123.164', 
+                        help='Adres IP serwera obrazu (PC2 robota lub komputer z symulacją). '
+                             'Używany przez teleimager i televuer do przesyłania wideo. '
+                             'Domyślnie: 192.168.123.164')
+    
+    parser.add_argument('--network-interface', type=str, default=None, 
+                        help='Interfejs sieciowy dla komunikacji DDS (np. eth0, wlan0). '
+                             'Jeśli None, użyje domyślnego interfejsu. '
+                             'Przydatne gdy komputer ma wiele kart sieciowych.')
+    
+    # --- Flagi trybów ---
+    parser.add_argument('--motion', action = 'store_true', 
+                        help = 'Włącz tryb sterowania ruchem. '
+                               'Program może działać równolegle z programem sterowania ruchem robota. '
+                               'Robot może chodzić podczas gdy sterujesz ramionami.')
+    
+    parser.add_argument('--headless', action='store_true', 
+                        help='Włącz tryb bezgłowy (bez wyświetlacza). '
+                             'Do uruchamiania na urządzeniach bez monitora, np. PC2.')
+    
+    parser.add_argument('--sim', action = 'store_true', 
+                        help = 'Włącz tryb symulacji Isaac. '
+                               'Łączy się z symulatorem zamiast fizycznego robota. '
+                               'Bezpieczne dla testowania bez sprzętu.')
+    
+    parser.add_argument('--ipc', action = 'store_true', 
+                        help = 'Włącz serwer IPC do obsługi wejścia; w przeciwnym razie użyj sshkeyboard. '
+                               'IPC pozwala sterować programem z innych procesów.')
+    
+    parser.add_argument('--affinity', action = 'store_true', 
+                        help = 'Włącz wysoki priorytet i ustaw tryb powinowactwa CPU. '
+                               'Rezerwuje rdzenie CPU dla tego programu (zaawansowane).')
+    
+    # --- Tryb nagrywania i informacje o zadaniu ---
+    parser.add_argument('--record', action = 'store_true', 
+                        help = 'Włącz tryb nagrywania danych. '
+                               'Naciśnij "s" aby rozpocząć/zatrzymać nagrywanie.')
+    
+    parser.add_argument('--task-dir', type = str, default = './utils/data/', 
+                        help = 'Ścieżka zapisu danych nagrań')
+    
+    parser.add_argument('--task-name', type = str, default = 'pick cube', 
+                        help = 'Nazwa pliku zadania dla nagrania')
+    
+    parser.add_argument('--task-goal', type = str, default = 'pick up cube.', 
+                        help = 'Cel zadania do zapisania w pliku JSON')
+    
+    parser.add_argument('--task-desc', type = str, default = 'task description', 
+                        help = 'Opis zadania do zapisania w pliku JSON')
+    
+    parser.add_argument('--task-steps', type = str, default = 'step1: do this; step2: do that;', 
+                        help = 'Kroki zadania do zapisania w pliku JSON')
 
+    # Parsuj argumenty przekazane przez użytkownika
     args = parser.parse_args()
-    logger_mp.info(f"args: {args}")
+    logger_mp.info(f"Argumenty programu: {args}")
 
     try:
         # setup dds communication domains id
