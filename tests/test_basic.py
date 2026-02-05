@@ -3,4 +3,3 @@ def test_imports():
     import teleop
     import teleop.robot_control
     import teleop.utils
-    assert True
