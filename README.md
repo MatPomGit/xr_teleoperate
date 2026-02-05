@@ -106,6 +106,17 @@ The currently supported devices in this repository:
   </tr>
 </table>
 
+## 📱 Meta Quest 3 Setup
+
+**For Meta Quest 3 users**, we provide a comprehensive setup guide in Polish: **[Meta Quest 3 Setup Guide (Polski)](QUEST3_SETUP_pl.md)**
+
+This guide covers:
+- Network configuration for Quest 3
+- SSL certificate setup specific to Quest devices
+- Controller vs. hand tracking modes
+- Step-by-step connection procedure
+- Performance tuning tips
+- Troubleshooting common issues
 
 
 # 1. 📦 Installation
