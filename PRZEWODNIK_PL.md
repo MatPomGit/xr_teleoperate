@@ -215,7 +215,7 @@ python teleop_hand_and_arm.py --sim --ee=dex3
 - Cel: Zrozumienie struktury kinematycznej
 
 **Ćwiczenie 2: Kalibracja**
-- Zadanie: Wykalib calibrate offsety stawów
+- Zadanie: Wykalibruj offsety stawów
 - Cel: Praktyka pracy z fizycznym sprzętem
 
 **Ćwiczenie 3: Zbieranie Danych**
