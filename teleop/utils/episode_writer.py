@@ -1,27 +1,82 @@
+"""
+episode_writer.py - Moduł do nagrywania danych teleoperation
+===========================================================
+
+Ten moduł jest odpowiedzialny za zapisywanie wszystkich danych z sesji teleoperation do plików.
+Dane te mogą być później użyte do:
+- Uczenia maszynowego (imitation learning)
+- Analizy ruchów robota
+- Odtwarzania i debugowania
+- Tworzenia zestawów danych treningowych
+
+DLA POCZĄTKUJĄCYCH:
+- Episode (epizod) = jedna sesja nagrywania od naciśnięcia 's' do ponownego naciśnięcia 's'
+- Każdy epizod zawiera: obrazy z kamer, pozycje stawów, stany dłoni, timestampy
+- Dane są zapisywane w strukturze katalogów: task_dir/episode_XXX/
+"""
+
 import os
-import cv2
-import json
-import datetime
-import numpy as np
+import cv2          # OpenCV - biblioteka do przetwarzania obrazów
+import json         # Do zapisywania metadanych w formacie JSON
+import datetime     # Do znaczników czasowych
+import numpy as np  # Do operacji na tablicach liczb (pozycje stawów, etc.)
 import time
-from .rerun_visualizer import RerunLogger
-from queue import Queue, Empty
-from threading import Thread
+from .rerun_visualizer import RerunLogger  # Do wizualizacji nagrań w czasie rzeczywistym
+from queue import Queue, Empty              # Do asynchronicznego przetwarzania danych
+from threading import Thread                # Do działania w tle
 import logging_mp
 logger_mp = logging_mp.get_logger(__name__)
 
 class EpisodeWriter():
+    """
+    Klasa do nagrywania i zapisywania epizodów teleoperation.
+    
+    Główne funkcje:
+    1. Tworzy strukturę katalogów dla każdego epizodu
+    2. Zapisuje obrazy z kamer jako pliki wideo (MP4)
+    3. Zapisuje dane stawów jako pliki NumPy (NPZ)
+    4. Zapisuje metadane jako JSON
+    5. Opcjonalnie wizualizuje dane w czasie rzeczywistym (Rerun)
+    
+    Dla początkujących - Co zapisujemy:
+    - Obrazy z kamer głowy i nadgarstków (30 FPS)
+    - Pozycje wszystkich stawów robota (kąty)
+    - Stany dłoni zręcznościowych (pozycje palców)
+    - Akcje wysłane do robota
+    - Metadane (data, czas, cel zadania, etc.)
+    """
+    
     def __init__(self, task_dir, task_goal=None, task_desc = None, task_steps = None, frequency=30, image_size=[640, 480], rerun_log = True):
         """
-        image_size: [width, height]
+        Inicjalizuje EpisodeWriter.
+        
+        Args:
+            task_dir (str): Katalog główny gdzie zapisywać dane (np. './data/pick_cube/')
+            task_goal (str): Cel zadania (np. "Podnieś czerwony kubek")
+            task_desc (str): Opis zadania (np. "Robot podnosi kubek ze stołu")
+            task_steps (str): Kroki zadania (np. "1: Zbliż rękę, 2: Chwyć, 3: Podnieś")
+            frequency (int): Częstotliwość nagrywania w Hz (klatek na sekundę)
+            image_size (list): Rozmiar obrazów [szerokość, wysokość]
+            rerun_log (bool): Czy włączyć wizualizację w czasie rzeczywistym
+            
+        Dla początkujących:
+        Ta funkcja przygotowuje wszystko do nagrywania:
+        - Tworzy katalogi jeśli nie istnieją
+        - Znajduje numer ostatniego epizodu (aby kontynuować numerację)
+        - Inicjalizuje kolejkę do przetwarzania danych w tle
+        - Uruchamia wątek roboczy do zapisywania
         """
-        logger_mp.info("==> EpisodeWriter initializing...\n")
-        self.task_dir = task_dir
+        logger_mp.info("==> EpisodeWriter inicjalizacja...\n")
+        self.task_dir = task_dir  # Gdzie zapisywać dane
+        
+        # Teksty opisujące zadanie (zapisywane w metadanych)
         self.text = {
-            "goal": "Pick up the red cup on the table.",
-            "desc": "task description",
-            "steps":"step1: do this; step2: do that; ...",
+            "goal": "Podnieś czerwony kubek ze stołu.",    # Cel zadania
+            "desc": "opis zadania",                        # Szczegółowy opis
+            "steps":"krok1: zrób to; krok2: zrób tamto; ...",  # Instrukcje krok po kroku
         }
+        
+        # Nadpisz domyślne teksty jeśli użytkownik podał własne
         if task_goal is not None:
             self.text['goal'] = task_goal
         if task_desc is not None:
@@ -29,54 +84,101 @@ class EpisodeWriter():
         if task_steps is not None:
             self.text['steps'] = task_steps
 
-        self.frequency = frequency
-        self.image_size = image_size
+        self.frequency = frequency      # Jak często zapisujemy ramki (30 Hz = 30 razy na sekundę)
+        self.image_size = image_size    # Rozmiar obrazów do zapisania
 
+        # Opcjonalna wizualizacja w czasie rzeczywistym (Rerun)
         self.rerun_log = rerun_log
         if self.rerun_log:
-            logger_mp.info("==> RerunLogger initializing...\n")
+            logger_mp.info("==> RerunLogger inicjalizacja...\n")
+            # Rerun to narzędzie do wizualizacji danych robotycznych w 3D
             self.rerun_logger = RerunLogger(prefix="online/", IdxRangeBoundary = 60, memory_limit = "300MB")
-            logger_mp.info("==> RerunLogger initializing ok.\n")
+            logger_mp.info("==> RerunLogger inicjalizacja zakończona.\n")
         
-        self.item_id = -1
-        self.episode_id = -1
+        # ID liczniki
+        self.item_id = -1      # ID aktualnej ramki w epizodzie
+        self.episode_id = -1   # ID aktualnego epizodu
+        
+        # Znajdź ostatni numer epizodu jeśli katalog już istnieje
         if os.path.exists(self.task_dir):
-            episode_dirs = [episode_dir for episode_dir in os.listdir(self.task_dir) if 'episode_' in episode_dir and not episode_dir.endswith('.zip')]
+            # Znajdź wszystkie katalogi episode_XXX (ale nie .zip)
+            episode_dirs = [episode_dir for episode_dir in os.listdir(self.task_dir) 
+                           if 'episode_' in episode_dir and not episode_dir.endswith('.zip')]
+            # Posortuj i weź ostatni (największy numer)
             episode_last = sorted(episode_dirs)[-1] if len(episode_dirs) > 0 else None
+            # Wyciągnij numer z nazwy (np. "episode_5" -> 5)
             self.episode_id = 0 if episode_last is None else int(episode_last.split('_')[-1])
-            logger_mp.info(f"==> task_dir directory already exist, now self.episode_id is:{self.episode_id}\n")
+            logger_mp.info(f"==> Katalog task_dir już istnieje, obecny self.episode_id to:{self.episode_id}\n")
         else:
+            # Utwórz katalog jeśli nie istnieje
             os.makedirs(self.task_dir)
-            logger_mp.info(f"==> episode directory does not exist, now create one.\n")
+            logger_mp.info(f"==> Katalog epizodów nie istnieje, tworzę nowy.\n")
+        
+        # Przygotuj metadane
         self.data_info()
 
-        self.is_available = True  # Indicates whether the class is available for new operations
-        # Initialize the queue and worker thread
-        self.item_data_queue = Queue(-1)
-        self.stop_worker = False
-        self.need_save = False  # Flag to indicate when save_episode is triggered
+        # === SYSTEM KOLEJKI DO PRZETWARZANIA W TLE ===
+        # Dlaczego kolejka? Zapisywanie danych na dysk jest wolne.
+        # Gdybyśmy zapisywali bezpośrednio w głównej pętli, spowolniłoby to sterowanie robotem!
+        # Zamiast tego, dane są dodawane do kolejki, a osobny wątek zapisuje je w tle.
+        
+        self.is_available = True  # Czy klasa jest gotowa do przyjmowania nowych danych
+        
+        # Kolejka FIFO (First In First Out) - pierwsze dane wchodzą, pierwsze wychodzą
+        self.item_data_queue = Queue(-1)  # -1 = nieograniczony rozmiar
+        self.stop_worker = False          # Flaga do zatrzymania wątku roboczego
+        self.need_save = False            # Czy trzeba zapisać epizod
+        
+        # Uruchom wątek roboczy w tle
         self.worker_thread = Thread(target=self.process_queue)
         self.worker_thread.start()
 
-        logger_mp.info("==> EpisodeWriter initialized successfully.\n")
+        logger_mp.info("==> EpisodeWriter zainicjalizowany pomyślnie.\n")
     
     def is_ready(self):
+        """
+        Sprawdza czy EpisodeWriter jest gotowy do przyjmowania danych.
+        
+        Returns:
+            bool: True jeśli gotowy, False jeśli zajęty
+            
+        Dla początkujących:
+        Ta metoda pozwala głównej pętli programu sprawdzić czy
+        może bezpiecznie dodać więcej danych do nagrania.
+        """
         return self.is_available
 
     def data_info(self, version='1.0.0', date=None, author=None):
+        """
+        Przygotowuje metadane opisujące nagrane dane.
+        
+        Args:
+            version (str): Wersja formatu danych
+            date (str): Data nagrania
+            author (str): Kto nagrał dane
+            
+        Dla początkujących:
+        Metadane to "dane o danych" - informacje opisujące
+        co zostało nagrane, kiedy, przez kogo, w jakim formacie.
+        Są zapisywane w pliku JSON dla łatwego odczytu.
+        """
         self.info = {
                 "version": "1.0.0" if version is None else version, 
                 "date": datetime.date.today().strftime('%Y-%m-%d') if date is None else date,
                 "author": "unitree" if author is None else author,
+                # Parametry obrazów
                 "image": {"width":self.image_size[0], "height":self.image_size[1], "fps":self.frequency},
+                # Parametry głębi (dla kamer 3D)
                 "depth": {"width":self.image_size[0], "height":self.image_size[1], "fps":self.frequency},
+                # Parametry audio (jeśli nagrywamy dźwięk)
                 "audio": {"sample_rate": 16000, "channels": 1, "format":"PCM", "bits":16},    # PCM_S16
+                # Nazwy stawów (zostaną wypełnione później)
                 "joint_names":{
-                    "left_arm":   [],
-                    "left_ee":  [],
-                    "right_arm":  [],
-                    "right_ee": [],
-                    "body":       [],
+                    "left_arm":   [],  # Stawy lewego ramienia
+                    "left_ee":  [],    # End-effector lewej ręki (dłoń)
+                    "right_arm":  [],  # Stawy prawego ramienia
+                    "right_ee": [],    # End-effector prawej ręki (dłoń)
+                    "body":       [],  # Stawy korpusu (talia, głowa)
                 },
 
                 "tactile_names": {
